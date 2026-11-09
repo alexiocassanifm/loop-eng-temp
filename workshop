@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""Workshop helper. Run from the root of your copy of this repository.
+
+    ./workshop doctor          check the tools; what only some exercises need is listed as not needed yet
+    ./workshop setup           labels, CODEOWNERS and the main ruleset on your copy
+    ./workshop reset <ex>      start an exercise from a clean branch
+    ./workshop events <file>   what a headless run did, turn by turn (exercise 1)
+    ./workshop hook            log every tool call to tool-log.txt (exercise 1)
+    ./workshop clear-log       empty tool-log.txt before the next run (exercise 1)
+    ./workshop guard           make a turn refuse to end on a wrong percent_of (memory)
+    ./workshop deploy [args]   write the fake production log for exercise 2
+
+On Windows, type `py workshop` where this says `./workshop`.
+
+Exercises you can reset to: ex1, ex2, ex3-goal, ex3-loop, memory, ex4, ex5. The starting
+branches are fetched from the public template, so they work in a copy made
+without "Include all branches".
+"""
+
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+
+# WORKSHOP_UPSTREAM overrides the template location, for rehearsing offline.
+UPSTREAM = os.environ.get("WORKSHOP_UPSTREAM", "https://github.com/FairMind-Gen-AI-Studio/loop-engineering-workshop.git")
+PLUGIN_KEY = "fairmind-coding@fairmind-plugins"
+SECRETS = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")  # either one
+EXERCISES = {
+    "ex1": "main",
+    "ex2": "ex2-start",
+    "ex3-goal": "ex3-goal-start",
+    "ex3-loop": "ex3-loop-start",
+    "memory": "main",
+    "ex4": "ex4-start",
+    "ex5": "main",
+}
+# Files an exercise writes that a reset must not carry into the next one.
+SCRATCH = [".fairmind/active-context.json", ".claude/settings.local.json", "deploy.log", "run.jsonl", "tool-log.txt", "CLAUDE.md"]
+LABELS = {
+    "reviewed": ("0E8A16", "The Claude review has run on the latest push"),
+    "defect": ("D73A4A", "Found while using our own tools"),
+    "pr-opened": ("1D76DB", "Repair routine opened a fix"),
+    "needs-info": ("FBCA04", "Repair routine could not reproduce as written"),
+    "cannot-reproduce": ("BFD4F2", "Repair routine ran the reproduction and it passed"),
+}
+ROOT = pathlib.Path(__file__).resolve().parent
+
+
+def run(*cmd, check=True, capture=True):
+    result = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=capture)
+    if check and result.returncode != 0:
+        sys.exit(f"failed: {' '.join(cmd)}\n{result.stderr.strip()}")
+    return result
+
+
+def ok(label, passed, hint=""):
+    print(f"  {'✓' if passed else '✗'} {label}" + ("" if passed or not hint else f"  → {hint}"))
+    return passed
+
+
+def later(label, passed, hint=""):
+    # Needed only by exercises 4 and 5, or by exercise 3 run 2.
+    mark = "✓" if passed else "·"
+    print(f"  {mark} {label}" + ("" if passed or not hint else f"  → not needed yet: {hint}"))
+
+
+def doctor():
+    print("tools")
+    results = []
+    for tool, hint in [("git", "install git (on Windows: Git for Windows, which brings Git Bash)"),
+                       ("gh", "https://cli.github.com"), ("claude", "https://claude.com/claude-code")]:
+        results.append(ok(tool, shutil.which(tool) is not None, hint))
+    results.append(ok(f"python {sys.version.split()[0]}", sys.version_info >= (3, 10), "python 3.10 or later"))
+    try:
+        import pytest  # noqa: F401
+        results.append(ok("pytest", True))
+    except ImportError:
+        results.append(ok("pytest", False, "python3 -m pip install pytest"))
+
+    # Claude Code ignores this repository's .claude/settings.json (the commands the
+    # exercises pre-approve) until you have opened `claude` here once and trusted it.
+    try:
+        projects = json.loads((pathlib.Path.home() / ".claude.json").read_text()).get("projects", {})
+    except (OSError, ValueError):
+        projects = {}
+    # Trusting a folder also trusts everything inside it.
+    trusted = any(projects.get(key, {}).get("hasTrustDialogAccepted")
+                  for folder in (ROOT, *ROOT.parents) for key in {str(folder), folder.as_posix()})
+    results.append(ok("this folder is trusted", trusted,
+                      "run `claude` here once, accept the trust question, then /exit"))
+
+    authed = bool(shutil.which("gh")) and run("gh", "auth", "status", check=False).returncode == 0
+    results.append(ok("gh is logged in", authed, "gh auth login"))
+
+    print("\nexercises 4 and 5")
+    if authed:
+        listed = run("gh", "secret", "list", check=False).stdout.split()
+        present = [name for name in SECRETS if name in listed]
+        later(f"review secret {present[0] if present else ''}".strip(), bool(present),
+              "gh secret set ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN, see README)")
+
+    print("\nadvanced, exercise 3 run 2")
+    later("jq", shutil.which("jq") is not None, "brew install jq / apt install jq / winget install jqlang.jq")
+    installed = pathlib.Path.home() / ".claude" / "plugins" / "installed_plugins.json"
+    try:
+        has_plugin = PLUGIN_KEY in json.loads(installed.read_text()).get("plugins", {})
+    except (OSError, ValueError):
+        has_plugin = False
+    later("fairmind-coding plugin", has_plugin,
+          "in Claude Code: /plugin marketplace add FairMind-Gen-AI-Studio/fairmind-plugins-public, "
+          "then /plugin install fairmind-coding@fairmind-plugins")
+    if os.name == "nt":
+        # The fairmind-coding loop gate calls `python3` from Git Bash; a python.org or
+        # winget Python only answers to `python` and `py`.
+        bash = shutil.which("bash")
+        found = bool(bash) and run(bash, "-lc", "python3 --version", check=False).returncode == 0
+        later("python3 inside Git Bash", found,
+              "not tested on Windows yet: do exercise 3 run 2 with someone on macOS or Linux")
+
+    print("\nready to start" if all(results) else "\nfix the ✗ lines above, then run ./workshop doctor again")
+    return 0 if all(results) else 1
+
+
+def setup():
+    repo = run("gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner").stdout.strip()
+    user = run("gh", "api", "user", "-q", ".login").stdout.strip()
+    print(f"setting up {repo} for @{user}")
+
+    for name, (color, description) in LABELS.items():
+        run("gh", "label", "create", name, "--color", color, "--description", description, "--force")
+    print(f"  ✓ labels: {', '.join(LABELS)}")
+
+    owners = ROOT / ".github" / "CODEOWNERS"
+    text = owners.read_text()
+    if "@OWNER" in text:
+        owners.write_text(text.replace("@OWNER", f"@{user}"))
+        run("git", "add", str(owners))
+        run("git", "commit", "-m", f"CODEOWNERS: @{user} owns the paths that stay human")
+        run("git", "push", "origin", "HEAD")
+        print(f"  ✓ CODEOWNERS now names @{user} (committed and pushed)")
+    else:
+        print("  ✓ CODEOWNERS already names an owner")
+
+    existing = run("gh", "api", f"repos/{repo}/rulesets", "-q", ".[].name", check=False).stdout.split()
+    if "main" in existing:
+        print("  ✓ ruleset 'main' already exists")
+    else:
+        result = run("gh", "api", "-X", "POST", f"repos/{repo}/rulesets",
+                     "--input", ".github/rulesets/main.json", check=False)
+        if result.returncode != 0:
+            print("  ✗ ruleset not created: " + result.stderr.strip().splitlines()[-1]
+                  + "\n    rulesets need a public repository, or a paid plan for a private one")
+            return 1
+        print("  ✓ ruleset 'main': CI 'tests' required, code-owner review required, admins may bypass")
+    return 0
+
+
+def reset(exercise):
+    if exercise not in EXERCISES:
+        sys.exit(f"unknown exercise {exercise!r}; choose one of: {', '.join(EXERCISES)}")
+    branch = EXERCISES[exercise]
+    dirty = run("git", "status", "--porcelain").stdout.strip()
+    if dirty:
+        print("uncommitted changes will be discarded:\n" + dirty)
+        if input("continue? [y/N] ").strip().lower() != "y":
+            return 1
+    # A copy made from a template starts a new git history, so the template's
+    # branches share no commit with your main and a pull request from one would be
+    # refused. Instead, replay the difference between the template's main and the
+    # exercise branch on top of your own main.
+    run("git", "fetch", "--quiet", "origin", "main")
+    run("git", "fetch", "--quiet", UPSTREAM, f"+main:refs/workshop/main", f"+{branch}:refs/workshop/{branch}")
+    local = f"{exercise}-work"
+    run("git", "checkout", "--quiet", "--force", "-B", local, "origin/main")
+    for scratch in SCRATCH:
+        (ROOT / scratch).unlink(missing_ok=True)
+    if branch != "main":
+        patch = run("git", "diff", "--binary", "refs/workshop/main", f"refs/workshop/{branch}").stdout
+        applied = subprocess.run(["git", "apply", "--3way", "--index"], cwd=ROOT, input=patch, text=True,
+                                 capture_output=True)
+        if applied.returncode != 0:
+            sys.exit(f"could not start {exercise} on top of your main:\n{applied.stderr.strip()}\n"
+                     "ask the facilitator, or reset your main to the template's")
+        run("git", "commit", "--quiet", "-m", f"Start {exercise} from the workshop template")
+    print(f"on branch {local}, starting point of {exercise}. Open kit/{exercise.split('-')[0]}.md")
+    return 0
+
+
+def read_events(path):
+    # Windows PowerShell 5.1 writes `>` redirections as UTF-16, so honour a BOM.
+    raw = pathlib.Path(path).read_bytes()
+    encoding = "utf-16" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
+    events = []
+    for line in raw.decode(encoding).splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            events.append(json.loads(line))
+    return events
+
+
+def events(path):
+    try:
+        stream = read_events(path)
+    except OSError as err:
+        sys.exit(f"cannot read {path}: {err.strerror}. Run step 1 of exercise 1 first.")
+    # The stream carries one content block per event, so one answer from the model
+    # spans several events sharing a message id. That answer is one turn, one time
+    # around the loop, however many tools it asks for.
+    turns, failed = {}, set()
+    for index, event in enumerate(stream):
+        message = event.get("message", {})
+        if event.get("type") == "assistant":
+            turns.setdefault(message.get("id", index), []).extend(message.get("content", []))
+        elif event.get("type") == "user":
+            failed.update(block.get("tool_use_id") for block in message.get("content", [])
+                          if isinstance(block, dict) and block.get("is_error"))
+
+    number, last_text = 0, ""
+    for turn_number, blocks in enumerate(turns.values(), 1):
+        print(f"turn {turn_number}")
+        calls = [block for block in blocks if block.get("type") == "tool_use"]
+        for call in calls:
+            number += 1
+            print(f"  {number:>3}  {call['name']}{' FAILED' if call.get('id') in failed else ''}  {target(call)}".rstrip())
+        if not calls:
+            print("       no tool call: the loop ends here")
+            last_text = " ".join(block.get("text", "") for block in blocks if block.get("type") == "text").strip()
+
+    print(f"\n{len(turns)} turns, {number} tool calls")
+    print("\nthe message that ended the loop (no tool call):")
+    print("  " + (last_text[:600] or "(none found)").replace("\n", "\n  "))
+    return 0
+
+
+def target(call):
+    # What a tool call acted on: a file, a command, a search.
+    tool_input = call.get("input", {})
+    value = next((tool_input[key] for key in ("file_path", "command", "pattern", "skill") if key in tool_input), "")
+    return str(value).strip().split("\n")[0].removeprefix(f"{ROOT.as_posix()}/")[:70]
+
+
+def hook():
+    # The interpreter running this script, by absolute path, so the hook works on
+    # every OS without jq. Forward slashes work in Git Bash, which README requires
+    # on Windows, as well as everywhere else.
+    command = f'"{pathlib.Path(sys.executable).as_posix()}" "{(ROOT / "workshop").as_posix()}" log-tool'
+    settings = {"hooks": {"PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": command}]}]}}
+    target = ROOT / ".claude" / "settings.local.json"
+    target.parent.mkdir(exist_ok=True)
+    target.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    print(f"wrote {target.relative_to(ROOT).as_posix()} (not committed; ./workshop reset removes it):\n")
+    print(target.read_text(encoding="utf-8"))
+    return 0
+
+
+def guard():
+    # A Stop hook runs after every turn; exit code 2 from scripts/check_percent.py
+    # refuses the stop and hands its message back to Claude. Same absolute-path
+    # pattern as `hook`, so it works on every OS.
+    command = f'"{pathlib.Path(sys.executable).as_posix()}" "{(ROOT / "scripts" / "check_percent.py").as_posix()}"'
+    settings = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": command}]}]}}
+    target = ROOT / ".claude" / "settings.local.json"
+    target.parent.mkdir(exist_ok=True)
+    target.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    print(f"wrote {target.relative_to(ROOT).as_posix()} (not committed; ./workshop reset removes it):\n")
+    print(target.read_text(encoding="utf-8"))
+    return 0
+
+
+def log_tool():
+    # Called by the hook: the event arrives as JSON on stdin.
+    event = json.loads(sys.stdin.buffer.read().decode("utf-8") or "{}")
+    with open(ROOT / "tool-log.txt", "a", encoding="utf-8") as log:
+        failed = event.get("hook_event_name") == "PostToolUseFailure"
+        print(event.get("tool_name", "?") + (" FAILED" if failed else ""), file=log)
+    return 0
+
+
+def clear_log():
+    (ROOT / "tool-log.txt").unlink(missing_ok=True)
+    print("tool-log.txt is empty; the next run starts it again")
+    return 0
+
+
+def deploy(args):
+    return subprocess.call([sys.executable, str(ROOT / "scripts" / "fake_deploy.py"), *args], cwd=ROOT)
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    command, rest = argv[0], argv[1:]
+    if command == "doctor":
+        return doctor()
+    if command == "setup":
+        return setup()
+    if command == "reset" and len(rest) == 1:
+        return reset(rest[0])
+    if command == "events" and len(rest) == 1:
+        return events(rest[0])
+    if command == "hook":
+        return hook()
+    if command == "guard":
+        return guard()
+    if command == "log-tool":
+        return log_tool()
+    if command == "clear-log":
+        return clear_log()
+    if command == "deploy":
+        return deploy(rest)
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    # ✓ and ✗ must survive a Windows console or a redirected stdout.
+    sys.stdout.reconfigure(encoding="utf-8")
+    os.chdir(ROOT)
+    sys.exit(main(sys.argv[1:]))

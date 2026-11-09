@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+deploy.log
+run.jsonl
+tool-log.txt
+.fairmind/active-context.json
+.fairmind/traces/
+.claude/settings.local.json

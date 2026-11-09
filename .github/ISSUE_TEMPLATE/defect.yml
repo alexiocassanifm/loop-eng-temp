@@ -1,0 +1,51 @@
+name: Defect
+description: Something broke while you were using your own tools. One defect, one issue.
+labels: [defect]
+body:
+  - type: input
+    id: key
+    attributes:
+      label: Key
+      description: >
+        Derived from what broke, never from your description of it:
+        `<repo>:<path/to/file.py>::<symbol>:<failure-shape>`, no line number.
+        Shapes are listed in kit/ex5/failure-shapes.md. Search all issues for this
+        key before filing: `gh issue list --state all --search "<key> in:body"`.
+      placeholder: "loop-engineering-workshop:shop/pricing.py::total:wrong-output"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What broke
+      description: One line. The behaviour, not the fix and not the cause.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduce
+      description: Exact enough that someone else, or a routine, can run it tonight.
+      value: |
+        - Commit:            <sha>
+        - Command:           <exact invocation, copy-pasteable>
+        - Expected / Actual: <two lines>
+        - Anchor:            <path/to/file.py> — <symbol>
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Verbatim output, trimmed. Never a paraphrase.
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      description: The order the repair routine works in.
+      options: [S1 · broken for everyone, S2 · broken for some, S3 · wrong but survivable, S4 · rough edge]
+    validations:
+      required: true

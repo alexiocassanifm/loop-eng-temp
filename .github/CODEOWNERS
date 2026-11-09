@@ -1,0 +1,7 @@
+# Paths that never merge without a person. With "require review from code owners"
+# on (the ruleset in .github/rulesets/main.json), a pull request touching them needs
+# an approval from the owner below. `./workshop setup` replaces @OWNER with you.
+#
+# Exercise 5: decide which paths of this repository belong here, and why.
+
+/.github/ @OWNER

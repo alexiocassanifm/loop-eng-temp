@@ -1,0 +1,135 @@
+# Claude reviews every pull request: inline comments on specific lines, one summary
+# comment with the verdict, then the label `reviewed`, which is what a merge routine
+# listens for (routines trigger on pull request events, not on reviews).
+#
+# Two things to know before you touch this file:
+# - claude-code-action refuses to run when this file differs from the copy on the
+#   default branch, and then EXITS GREEN having reviewed nothing. Edit it on main,
+#   never on a branch. A review that finishes in about fifteen seconds did not run.
+# - Never make this a required check. The required check is CI's `tests`.
+#
+# Credential, either one (see README):
+# - ANTHROPIC_API_KEY, an Anthropic API key, billed as API usage; or
+# - CLAUDE_CODE_OAUTH_TOKEN, from `claude setup-token`, billed to a Claude subscription.
+# With both set, the API key is used.
+
+name: Claude review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write   # the summary comment is posted with gh pr comment
+  issues: write          # labels live on the issues API
+  id-token: write
+
+jobs:
+  review:
+    name: Claude review
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      # The action does not fail without a credential: it exits green having
+      # posted nothing. Fail here instead, printing only the length.
+      - name: Assert a review credential is present
+        env:
+          API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set -eu
+          if [ -n "${API_KEY:-}" ]; then
+            echo "using ANTHROPIC_API_KEY (length ${#API_KEY})"
+          elif [ -n "${TOKEN:-}" ]; then
+            echo "using CLAUDE_CODE_OAUTH_TOKEN (length ${#TOKEN})"
+          else
+            echo "::error::No review credential. Set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN as a repository secret (see README)." >&2
+            exit 1
+          fi
+
+      # A push to a reviewed PR must be reviewed again, and must fire the label
+      # event again: take the label off before the new review starts.
+      - name: Start the review
+        id: start
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -u
+          printf 'started_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          gh api -X DELETE "repos/$REPO/issues/$PR/labels/reviewed" >/dev/null 2>&1 || true
+
+      - uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c # v1
+        id: review
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Review this pull request and post your feedback directly on it. The
+            branch is checked out in the working directory.
+
+            Use `mcp__github_inline_comment__create_inline_comment` for concrete
+            issues on specific lines. Use `gh pr comment` to post one overall
+            summary at the end, and post it even when you find nothing: a run that
+            posts nothing is indistinguishable from a reviewer that never ran.
+            Do not answer in chat; only post on GitHub.
+
+            Do the work yourself in this turn; do not wait on background tasks.
+            You are a read-only reviewer: do not create or edit repository files.
+
+            This repository is a small checkout in `shop/`. Amounts are integer
+            cents. VAT applies to items only; shipping is a flat fee, never taxed.
+            Check that behaviour matches the docstrings and the tests, that money is
+            never computed in floats, and that a test would fail if the feature were
+            deleted. Prefer one well-evidenced finding over five speculative ones:
+            cite the line and say what input breaks it.
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,mcp__github__get_*,mcp__github__list_*,mcp__github__search_*,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+            --disallowedTools "ScheduleWakeup"
+
+      # A green action is not a delivered review. Count what claude[bot] posted
+      # since this run started, on all three channels, and fail on silence.
+      - name: Did the review reach the pull request?
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          SINCE: ${{ steps.start.outputs.started_at }}
+        run: |
+          set -eu
+          count() { gh api --paginate "$1" --jq "[.[] | select(.user.login == \"claude[bot]\") | select((.created_at // .submitted_at) >= \"$SINCE\")] | length" | awk '{s+=$1} END {print s+0}'; }
+          inline=$(count "repos/$REPO/pulls/$PR/comments")
+          summary=$(count "repos/$REPO/issues/$PR/comments")
+          reviews=$(count "repos/$REPO/pulls/$PR/reviews")
+          echo "since $SINCE: inline=$inline summary=$summary reviews=$reviews"
+          if [ $((inline + summary + reviews)) -eq 0 ]; then
+            echo "::error::The review ran and posted nothing on the pull request." >&2
+            exit 1
+          fi
+
+      - name: Label the pull request as reviewed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -eu
+          gh label create reviewed --repo "$REPO" --color 0E8A16 \
+            --description "The Claude review has run on the latest push" --force
+          gh api "repos/$REPO/issues/$PR/labels" -f 'labels[]=reviewed' >/dev/null
+          echo "labelled PR #$PR as reviewed"

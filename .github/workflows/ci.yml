@@ -1,0 +1,32 @@
+name: CI
+
+# Every push, on every branch: a pull request's head commit gets its `tests` check
+# from the push run, so there is no need to run twice on pull_request.
+on:
+  push:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    # This job's name is the required status check in .github/rulesets/main.json.
+    name: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      - name: Unit tests
+        run: python -m pytest
+      # The unit tests take a second. Real pipelines take minutes, and exercise 2
+      # needs something to wait for, so this step waits and says so. It checks nothing.
+      - name: Simulated integration stage
+        run: python scripts/integration_stage.py 100
