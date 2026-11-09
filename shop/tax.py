@@ -5,4 +5,4 @@ VAT_RATE = Decimal("0.22")
 
 def vat(amount: int, rate: Decimal = VAT_RATE) -> int:
     """VAT on `amount` cents, rounded half up to the cent."""
-    return int((Decimal(amount) * rate).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    return int(Decimal(amount) * rate)
